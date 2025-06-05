@@ -1,107 +1,50 @@
 import discord
-from discord.ext import commands
-from discord import app_commands
+from discord.ext import commands, tasks
 import os
 import asyncio
+from datetime import timedelta
 
 # Load environment variables
 TOKEN = os.getenv("BOT_TOKEN")
 GUILD_ID = 1329827340850827274
-CATEGORY_ID = 1368300793056464998  # The category for the text channels for captainreset command
-TO_VC_ID = 1379816672851923085
-NEW_ROLE_ID = 1368336669861875845  # Role to remove on channel join
-
-CHANNEL_ROLE_MAP = {
-    1378100842598629518: (1379814953619558530, 1379812422264557729),
-    1378100860562702358: (1379815000306090034, 1379812422264557729),
-    1379797554367037581: (1379815009470775358, 1379812422264557729),
-    1379797571010301963: (1379815013845438554, 1379812422264557729),
-    1379797582255231138: (1379815016970195146, 1379812422264557729),
-    1379797629533290537: (1379815020015386757, 1379812422264557729),
-}
+NEW_ROLE_ID = 1379812422264557729  # Role to assign and remove
+TIMEOUT_ROLE_ID = 1369889238375596162  # Role for timed-out users
+CATEGORY_ID = 1368300793056464998  # Category ID for text channels
+TRACKED_CHANNEL_IDS = [
+    1368307501564563669,
+    1368440679507951757,
+    1368441003291181056,
+    1368441708211343440,
+    1368441771251470497
+]
 
 intents = discord.Intents.all()
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="/", intents=intents, application_id=YOUR_APPLICATION_ID)
 
 # For storing votes per message
 vote_sessions = {}
 
-class VoteView(discord.ui.View):
-    def __init__(self, initiator: discord.Member):
-        super().__init__(timeout=60)  # 60 seconds timeout
-        self.initiator = initiator
-        self.yes_votes = set()
-        self.no_votes = set()
-        self.total_votes = 0
-        self.message = None  # Will hold the message object after sending
+# Custom Message for Captain Reset Protocol
+CUSTOM_MESSAGE = """
+🔁 Captain Reset Protocol
 
-    async def update_message(self):
-        # Update the button labels with vote counts
-        yes_count = len(self.yes_votes)
-        no_count = len(self.no_votes)
-        content = f"Vote for captain reset by {self.initiator.display_name}\n" \
-                  f"Yes: {yes_count} | No: {no_count}\n" \
-                  f"Need 6/10 YES votes to pass."
-        await self.message.edit(content=content, view=self)
+Please use /captainreset to initiate a captain reset.
 
-        # Check if threshold reached
-        if yes_count >= 6:
-            await self.success_action()
+🗳️ If the vote ends in a 5 Yes / 5 No tie, a coinflip will be triggered.
+The user who called the vote will choose Heads or Tails — if guessed correctly, the match will be closed.
 
-    async def success_action(self):
-        # Disable buttons
-        for child in self.children:
-            child.disabled = True
-        await self.update_message()
+🎙️ Important: All players must remain in the voice channel during captain selection.
+🚫 Any player who leaves after the process begins will receive an automatic timeout.
+"""
 
-        # Move initiator out and back in VC
-        guild = self.initiator.guild
-        voice_state = self.initiator.voice
-        if voice_state and voice_state.channel:
-            channel = voice_state.channel
-            try:
-                await self.initiator.move_to(None)  # Disconnect
-                await asyncio.sleep(1)
-                await self.initiator.move_to(channel)  # Reconnect
-                await self.message.channel.send(f"{self.initiator.mention} has been reset in their voice channel.")
-            except Exception as e:
-                await self.message.channel.send(f"Failed to reset {self.initiator.mention}: {e}")
-        else:
-            await self.message.channel.send(f"{self.initiator.mention} is not in a voice channel.")
-
-        self.stop()  # End the view
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message:
-            await self.message.edit(content="Vote timed out. Captain reset failed.", view=self)
-
-    def is_voter_eligible(self, interaction: discord.Interaction):
-        # Check user is not already voted and is in guild
-        if interaction.user.id in self.yes_votes or interaction.user.id in self.no_votes:
-            return False
-        return True
-
-    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
-    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.is_voter_eligible(interaction):
-            await interaction.response.send_message("You already voted!", ephemeral=True)
-            return
-        self.yes_votes.add(interaction.user.id)
-        self.total_votes += 1
-        await interaction.response.defer()
-        await self.update_message()
-
-    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
-    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.is_voter_eligible(interaction):
-            await interaction.response.send_message("You already voted!", ephemeral=True)
-            return
-        self.no_votes.add(interaction.user.id)
-        self.total_votes += 1
-        await interaction.response.defer()
-        await self.update_message()
+async def has_send_permissions(member):
+    """Check if the user has send_message permissions in any text channel within CATEGORY_ID."""
+    category = discord.utils.get(member.guild.categories, id=CATEGORY_ID)
+    for channel in category.text_channels:
+        perms = channel.permissions_for(member)
+        if perms.send_messages:  # Check if the user has permission to send messages in the text channel
+            return True
+    return False
 
 @bot.event
 async def on_ready():
@@ -112,54 +55,59 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to sync commands: {e}")
 
-@bot.tree.command(name="captainreset", description="Start a vote to reset your captain status", guild=discord.Object(id=GUILD_ID))
+@bot.tree.command(name="captainreset", description="Start a vote for captain reset", guild=discord.Object(id=GUILD_ID))
 async def captainreset(interaction: discord.Interaction):
-    # Only allow command in text channels under CATEGORY_ID with send_message perms
-
-    # Check channel category
-    if not interaction.channel or getattr(interaction.channel.category, "id", None) != CATEGORY_ID:
-        await interaction.response.send_message("You can only use this command in the designated category channels.", ephemeral=True)
-        return
-
-    # Check permissions for user in this channel (send_messages)
-    perms = interaction.channel.permissions_for(interaction.user)
-    if not perms.send_messages:
-        await interaction.response.send_message("You don't have permission to use this command in this channel.", ephemeral=True)
-        return
-
-    # Create and send vote view
-    view = VoteView(interaction.user)
-    content = f"Vote for captain reset by {interaction.user.display_name}\n" \
-              f"Yes: 0 | No: 0\n" \
-              f"Need 6/10 YES votes to pass."
-    message = await interaction.response.send_message(content, view=view, ephemeral=False)
-    view.message = await interaction.original_response()
+    """Start a captain reset vote."""
+    # Custom logic for captain reset initiation
+    await interaction.response.send_message("Captain reset vote has been initiated! Please cast your votes.", ephemeral=False)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
     guild = member.guild
 
-    # If member joins a voice channel or moves to a new one
-    if after.channel and (before.channel != after.channel):
+    # Check if the bot moved the user into another voice channel within the nominated category
+    if before.channel and after.channel:
+        # If the user is moved by the bot (the bot moved the user into another channel)
+        if after.channel.id in TRACKED_CHANNEL_IDS and after.channel.category and after.channel.category.id == CATEGORY_ID:
+            if before.channel != after.channel:  # User was moved into another voice channel
+                # Check if the bot moved the user by comparing the user and bot's voice state channel
+                if member.id != bot.user.id:  # This checks if the user moved themselves (if the member is not the bot)
+                    return  # No timeout applies if the user was moved by the bot
+                print(f"{member.display_name} was moved by the bot into another voice channel under nominated category. No timeout applied.")
+                return
 
-        # Check if the joined channel ID is in our map
-        roles_to_add_ids = CHANNEL_ROLE_MAP.get(after.channel.id)
-        if roles_to_add_ids:
-            roles_to_add = [guild.get_role(rid) for rid in roles_to_add_ids if guild.get_role(rid)]
-            role_to_remove = guild.get_role(NEW_ROLE_ID)  # Role to remove
+    # If the user leaves a tracked voice channel and has permissions in a text channel, apply timeout
+    if before.channel and before.channel.id in TRACKED_CHANNEL_IDS and after.channel is None:
+        if await has_send_permissions(member):
+            # Apply the 30-minute timeout if they have permission in a text channel
+            await apply_timeout(member)
 
+    # If the member joins a voice channel in the tracked list, assign role (check send permissions first)
+    if after.channel and after.channel.id in TRACKED_CHANNEL_IDS:
+        if await has_send_permissions(member):  # Only assign the role if they have send permissions in a text channel
+            role_to_add = guild.get_role(NEW_ROLE_ID)  # Role to add on join
             try:
-                # Add roles
-                await member.add_roles(*roles_to_add)
-                # Remove role
-                if role_to_remove:
-                    await member.remove_roles(role_to_remove)
-
-                print(f"Updated roles for {member.display_name} on joining channel {after.channel.name}")
-
+                if role_to_add:
+                    await member.add_roles(role_to_add)
+                print(f"Assigned role to {member.display_name} on joining channel {after.channel.name}")
             except Exception as e:
-                print(f"Failed to update roles for {member.display_name}: {e}")
+                print(f"Failed to assign role for {member.display_name}: {e}")
 
-# (Optional) Your existing on_guild_channel_delete or other event handlers go here...
+@bot.event
+async def on_guild_channel_delete(channel):
+    """Remove the assigned role when the user is no longer in a voice channel under the nominated category."""
+    if isinstance(channel, discord.VoiceChannel) and channel.category and channel.category.id == CATEGORY_ID:
+        guild = channel.guild
+        role_to_remove = guild.get_role(NEW_ROLE_ID)  # Role to remove
+        for member in guild.members:
+            # Check if the member was in a voice channel in the nominated category and is no longer in it
+            if role_to_remove in member.roles and (not member.voice.channel or member.voice.channel.id not in TRACKED_CHANNEL_IDS):
+                try:
+                    await member.remove_roles(role_to_remove)
+                    print(f"Removed role from {member.display_name} because they weren't in any VC in the specified category after deletion.")
+                except Exception as e:
+                    print(f"Failed to remove role for {member.display_name}: {e}")
 
-bot.run(TOKEN)
+async def apply_timeout(member):
+    """ Apply a timeout to the user if they leave the queue early. """
+    timeout_duration = time_
